@@ -7,12 +7,26 @@
 #define OPEN_TOLERANCE 10 // reading tolerance
 #define OPEN_SPEED 150 // counts per second
 #define STOP 0
-#define MAX_LOAD 150 // maximum load before stopping gripper (safety) 
+#define MAX_LOAD 200 // maximum load before stopping gripper (safety) 
 #define CALIBRATION_LOAD 80 // load when fingers touches sides
 #define LOAD_TOLERANCE 5
+#define CALIBRATION_ZONE 2500
 
-#define GRIPPED 640 // magnetic flux when gripped
+#define GRIP_SPEED -100
+#define GRIPPED 550.0 // magnetic flux when gripped
 #define FLUX_TOLERANCE 10
+#define GRIP_DONE "GD"
+#define GRIP_COMMAND "G"
+#define SENSOR_INTERVAL_MS 20
+
+#define DROP_SPEED 50
+#define RELEASE_DONE "RD"
+#define RELEASE_COMMAND "R"
+#define RELEASE_DELAY_MS 500
+
+#define ACTION_TIMEOUT 10
+
+#define SKIP_CALIBRATION false
 
 #define sgn(x) ((x) < 0 ? -1 : ((x) > 0 ? 1 : 0))
 
@@ -30,18 +44,23 @@ const int filterSize = 10;
 // Initialize an array to store past readings
 float filterArray[filterSize];
 
-const int detail = 1; 
+// 0: no detail, 1: magnet only, 2: all
+const int detail = 0; 
 
 // flags
 bool open = false;
 bool gripped = false;
 bool motion_end = false;
 
+bool gripping = false;
+bool releasing = false; 
+
 void setup() {
   Serial.begin(115200);
+  Serial.begin(9600); 
 
-  sensorSetup(); 
-
+  motorSetup(); 
+  
   ServoSerial.begin(1000000);
   servo.pSerial = &ServoSerial;
   delay(1000);
@@ -56,7 +75,6 @@ void setup() {
   // Get feedback from servo
   servoDetails(); 
 
-  Serial.println((servo.ReadPos(SERVO_ID)-GRIPPER_OPEN));
   delay(1000); 
 
   Serial.println("Press SPACE to continue");
@@ -68,9 +86,11 @@ void setup() {
 
   // Calibration
   int diff = 0; 
-  while(abs(servo.ReadLoad(SERVO_ID)) < CALIBRATION_LOAD) {
+  if (not SKIP_CALIBRATION){
+    while(abs(servo.ReadLoad(SERVO_ID)) < CALIBRATION_LOAD) {
     
-    if (abs(servo.ReadLoad(SERVO_ID)) > MAX_LOAD) {
+    // doesn't really work
+    if ((abs(servo.ReadLoad(SERVO_ID)) > MAX_LOAD) and (servo.ReadPos(SERVO_ID) < CALIBRATION_ZONE)) {
       eStop(); 
     }
 
@@ -78,21 +98,24 @@ void setup() {
       eStop(); 
     }
 
-    Serial.println("Calibrating motor...");
-    if (detail > 0) {
+    Serial.println("Calibrating motor... (SPACE to stop)");
+    if (detail > 1) {
       Serial.println("Load: " + String(servo.ReadLoad(SERVO_ID)));
     }
     if (abs(servo.ReadLoad(SERVO_ID)) > CALIBRATION_LOAD) {
       open = true; 
       servo.WriteSpe(SERVO_ID, STOP);
       servo.EnableTorque(SERVO_ID, STOP); 
+      gripped = false; 
       Serial.println("Calibration complete"); 
       break; 
     }
 
     diff = GRIPPER_OPEN - servo.ReadPos(SERVO_ID); 
     servo.WriteSpe(SERVO_ID, OPEN_SPEED);
+    }
   }
+  
 
   open = true; 
   servo.WriteSpe(SERVO_ID, STOP);
@@ -104,11 +127,15 @@ void setup() {
     Serial.println("Position after calibration:" + String(servo.ReadPos(SERVO_ID)));
     Serial.println("Load after calibration:" + String(servo.ReadLoad(SERVO_ID)));
   }
+
+  sensorSetup(); 
+
   delay(1000);
 }
 
 void loop() {
-   if (abs(servo.ReadLoad(SERVO_ID)) > MAX_LOAD) {
+  int load = abs(servo.ReadLoad(SERVO_ID)); 
+  if (load > MAX_LOAD) {
       eStop(); 
   }
 
@@ -116,17 +143,96 @@ void loop() {
 
   float norm = magnetDetails(); 
 
-  // stop motor if gripper has gripped something
-  if (norm > GRIPPED) {
-    servo.WriteSpe(SERVO_ID, STOP, 50);
-    gripped = true; 
-    Serial.println("Gripped"); 
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    Serial.println(command); 
+
+    manualServoControl(command);
+
+    if (command == GRIP_COMMAND) {
+      if (not gripped){
+        grip(); 
+      } else {Serial.println("Already gripped");}  
+    } 
+
+    if (command == RELEASE_COMMAND) {
+      if (gripped) {
+        release(); 
+      } else {Serial.println("Already released");}
+      
+    }
   }
 
-  manualServoControl(); 
-
-  delay(500);
+  delay(100);
 }
+
+
+void grip() {
+  unsigned long lastRead = 0;
+  // maybe can take away while when including ROS
+  while(abs(servo.ReadLoad(SERVO_ID)) < MAX_LOAD) {
+    mlx0.readData(data);
+    // Serial.println("RAW x:" + String(data.x) + " baseline:" + String(Data[0]));
+    // Serial.println("RAW y:" + String(data.y) + " baseline:" + String(Data[1]));
+    // Serial.println("RAW z:" + String(data.z) + " baseline:" + String(Data[2]));
+    delay(SENSOR_INTERVAL_MS);
+    float mag_flux = magnetDetails(); 
+    delay(SENSOR_INTERVAL_MS);
+    
+    
+    if (detail > 0) {
+      Serial.println("Flux:" + String(mag_flux));
+    }
+
+    if (mag_flux > GRIPPED) {
+    servo.WriteSpe(SERVO_ID, STOP, 50);
+    gripped = true; 
+    Serial.println(GRIP_DONE); 
+    return;
+    //while(true); 
+    } 
+
+  if (not gripped) {
+    if (detail > 0) {
+      Serial.println("GRIPPING...");
+    }
+    servo.WriteSpe(SERVO_ID, GRIP_SPEED); 
+    }
+  }
+  // if exceed maximum load, estop
+  eStop();
+}
+
+
+void release() {
+  servo.WriteSpe(SERVO_ID, DROP_SPEED);
+  unsigned long startTime = millis();
+
+  // drop object first (so load resets)
+  while (millis() - startTime < RELEASE_DELAY_MS) {
+    if (detail > 0){
+      Serial.println("DROPPING...");
+    }
+  }
+
+  servo.WriteSpe(SERVO_ID, OPEN_SPEED);
+  while (true) {
+    int load = abs(servo.ReadLoad(SERVO_ID));
+    if (load > MAX_LOAD) {
+      eStop();
+    }
+    if (load > CALIBRATION_LOAD) break;
+    if (detail > 0) {
+      Serial.println("RELEASING...");
+    }
+  }
+
+  servo.WriteSpe(SERVO_ID, STOP, 50);
+  gripped = false;
+  Serial.println(RELEASE_DONE);
+}
+
 
 // Function to add a new reading to the filter array and return the average
 float movingAverage(float newValue) {
@@ -146,7 +252,7 @@ float movingAverage(float newValue) {
 }
 
 
-void sensorSetup() {
+void motorSetup() {
   Wire.begin();
   Wire.setClock(100000);   // stay at 100 kHz for now
   delay(50);
@@ -161,8 +267,11 @@ void sensorSetup() {
       Serial.println(addr, HEX);
     }
   }
-  Serial.println("Done");
+  Serial.println("Motor connected");
+}
 
+
+void sensorSetup() {
   mlx0.begin(0,0);
   mlx0.setOverSampling(0);
   mlx0.setDigitalFiltering(0);
@@ -170,7 +279,7 @@ void sensorSetup() {
 
   mlx0.readData(data); //Read the values from the sensor
   Data[0]=data.x;Data[1]=data.y;Data[2]=data.z;
-  delay(300);
+  delay(500);
   //read again in case first read was corrupted
   mlx0.readData(data); //Read the values from the sensor
   Data[0]=data.x;Data[1]=data.y;Data[2]=data.z;
@@ -194,10 +303,13 @@ void servoDetails() {
   float actualLoad = servo.ReadLoad(SERVO_ID);
   float actualCur = servo.ReadCurrent(SERVO_ID); 
 
-  Serial.println("Speed:" + String(actualSpeed));
-  Serial.println("Position:" + String(actualPos));
-  Serial.println("Load:" + String(actualLoad));
-  Serial.println("Current:" + String(actualCur));
+  if (detail > 1){
+    Serial.println("Speed:" + String(actualSpeed));
+    Serial.println("Position:" + String(actualPos));
+    Serial.println("Load:" + String(actualLoad));
+    Serial.println("Current:" + String(actualCur));
+  }
+  
 }
 
 
@@ -213,47 +325,46 @@ float magnetDetails() {
   float avg_y = movingAverage(diffy); 
   float avg_z =  movingAverage(diffz); 
 
-  float norm = sqrt(avg_x * avg_x + avg_y * avg_y + avg_z * avg_z);
+  // float norm = sqrt(avg_x * avg_x + avg_y * avg_y + avg_z * avg_z);
+  float norm = sqrt(diffx * diffx + diffy * diffy + diffz * diffz);
+  // float avg_norm = movingAverage(norm); 
 
   if (detail > 0) { 
-    Serial.print(avg_x,0);
+    Serial.print(diffx,0);
     Serial.print(",");
-    Serial.print(avg_y,0);
+    Serial.print(diffy,0);
     Serial.print(",");
-    Serial.println(avg_z,0);
-  }
+    Serial.println(diffz,0);
 
-  Serial.println(norm); 
+    Serial.println("Flux norm: " + String(norm)); 
+  }
 
   return norm; 
 }
 
-void manualServoControl() {
-  char cmd = Serial.read();
-    
-    if (cmd == 'f') {
-      // Forward at speed 500
+
+void manualServoControl(String cmd) {
+    if (cmd == "f") {
       servo.WriteSpe(SERVO_ID, OPEN_SPEED, 50);
       Serial.println("Forward!");
       delay(1000);
       servo.WriteSpe(SERVO_ID, STOP, 50);
     }
-    else if (cmd == 'b') {
-      // Backward at speed 500
+    else if (cmd == "b") {
       servo.WriteSpe(SERVO_ID, -OPEN_SPEED, 50); 
       Serial.println("Backward!");
       delay(1000);
-      servo.WriteSpe(SERVO_ID, STOP, 50);b
-
-    }
-    else if (cmd == 's') {
-      // Stop
       servo.WriteSpe(SERVO_ID, STOP, 50);
-      servo.EnableTorque(SERVO_ID, STOP);
-      Serial.println("Stopped!");
-    }
 
-    else if (cmd == ' ') {
+    }
+    // else if (cmd == "s") {
+    //   // Stop
+    //   servo.WriteSpe(SERVO_ID, STOP, 50);
+    //   servo.EnableTorque(SERVO_ID, STOP);
+    //   Serial.println("Stopped!");
+    // }
+
+    else if (cmd == "s") {
       eStop(); 
     }
 }
